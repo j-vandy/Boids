@@ -1,0 +1,166 @@
+#pragma kernel main
+#include "util.cginc"
+
+struct Boid
+{
+    float3 position;
+    float4 rotation;
+};
+
+// attribute variable
+RWStructuredBuffer<Boid> boids;
+// uniform variable
+uint boid_count;
+float boid_speed;
+float boid_rot_speed;
+float viewing_dist;
+float avoid_dist;
+float avoidance_factor;
+float alignment_factor;
+float cohesion_factor;
+float delta_time;
+
+// THREE RULES TO CALC ROT
+//      - Steer away from any nearby boids (separation)
+//      - Steer to move in the same direction of nearby boids (alignment)
+//      - steer towards the center of any nearby boids (cohesion)
+// For more information on the process go to:
+// https://people.ece.cornell.edu/land/courses/ece4760/labs/s2021/Boids/Boids.html
+[numthreads(64,1,1)]
+void main (uint3 id : SV_DispatchThreadID)
+{
+    int neighbor_count = 0;
+    int avoid_count = 0;
+    
+    // get current boid position and rotation
+    const float3 CURR_POS = boids[id.x].position;
+    float3 avg_pos = float3(0, 0, 0);
+    float3 avg_avoid_pos = float3(0, 0, 0);
+    const float4 CURR_Q = boids[id.x].rotation;
+    float4 avoidance_q = CURR_Q;
+    float4 alignment_q = CURR_Q;
+    float4 cohesion_q = CURR_Q;
+    float4 avg_q = float4(0, 0, 0, 0);
+    
+    // loop through all boids
+    for (uint i = 0; i < boid_count; i++)
+    {
+        if (i == id.x)
+        {
+            continue;
+        }
+        
+        // find distance between current and tmp
+        Boid tmp = boids[i];
+        float dist = distance(CURR_POS, tmp.position);
+        
+        // check if boid in viewing radius
+        if (dist <= viewing_dist)
+        {
+            // check if boid in avoid radius
+            if (dist <= avoid_dist)
+            {
+                // add tmp position to average avoid position
+                avg_avoid_pos += tmp.position;
+                avoid_count++;
+            }
+            else
+            {
+                // add tmp position to average position
+                avg_pos += tmp.position;
+                neighbor_count++;
+               
+                // add tmp rotation to average quaterion
+                float4 q = tmp.rotation;
+                float weight = 1.0;
+                    
+                // correct for double cover
+                if (i > 0 && dot(q, CURR_Q) < 0.0)
+                {
+                    weight = -weight;
+                }
+                    
+                avg_q.x += weight * q.x;
+                avg_q.y += weight * q.y;
+                avg_q.z += weight * q.z;
+                avg_q.w += weight * q.w;
+            }
+        }
+    }
+   
+    // AVOIDANCE
+    if (avoid_count != 0)
+    {
+        // average avoid position
+        avg_avoid_pos /= avoid_count;
+        
+        // find rot matrix for looking away from avoid position
+        float3x3 rot_matrix = look_at(avg_avoid_pos, CURR_POS, float3(0, 1, 0));
+        
+        // convert rotation matrix to quaternion
+        float4 q = matrix_to_quaternion(rot_matrix);
+        
+        // slerp from current rotation to avoid rotation by avoidance factor
+        avoidance_q = slerp(CURR_Q, q, avoidance_factor);
+        avoidance_q = q;
+    }
+    
+    // ALIGNMENT
+    // average neighbor quaternion
+    if (neighbor_count != 0)
+    {
+        alignment_q = normalize(avg_q);
+    }
+    
+    // slerp from current rotation to average rotation by alignment factor
+    alignment_q = slerp(CURR_Q, alignment_q, alignment_factor);
+    
+    // COHESION
+    if (neighbor_count != 0)
+    {
+        // average neighbor position
+        avg_pos /= neighbor_count;
+        
+        // find rot matrix for looking towards average position
+        float3x3 rot_matrix = look_at(CURR_POS, avg_pos, float3(0, 1, 0));
+        
+        // convert rotation matrix to quaternion
+        float4 q = matrix_to_quaternion(rot_matrix);
+        
+        // slerp from current rotation to cohesion rotation by cohesion factor
+        cohesion_q = slerp(CURR_Q, q, cohesion_factor);
+    }
+   
+    // average avoidance, alignment, cohesion quaternions
+    float4 quaternions[] = { avoidance_q, alignment_q, cohesion_q };
+    float4 q = quaternion_avg(quaternions);
+    
+    // rotate towards q
+    q = rotate_towards(CURR_Q, q, boid_rot_speed * delta_time);
+    
+    // convert current quaternion rotation back to rotation matrix
+    float3x3 rot_matrix = quaternion_to_matrix(q);
+    
+    // calculate distance traveled vector and add to CURR_POS
+    float3 fwd = float3(0.0, 0.0, boid_speed * delta_time);
+    float3 dist = mul(rot_matrix, fwd);
+    float3 pos = CURR_POS;
+    
+    // in case rot_matrix throws error
+    if (!isnan(dist.x) && !isnan(dist.y) && !isnan(dist.z))
+    {
+        float3 collision_dist = mul(rot_matrix, float3(0, 0, 5));
+        if (in_collision(CURR_POS + collision_dist))
+        {
+            // force rotation towards center
+            rot_matrix = look_at(CURR_POS, float3(0, 0, 0), float3(0, 1, 0));
+            q = matrix_to_quaternion(rot_matrix);
+            dist = mul(rot_matrix, fwd);
+        }
+        pos += dist;
+    }
+    
+    // update position and rotation
+    boids[id.x].position = pos;
+    boids[id.x].rotation = q;
+}
